@@ -8,6 +8,7 @@ import React, {
   useRef,
 } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
+import MainLayoutShell from "@/components/layout/MainLayoutShell";
 import {
   SPEECH_REPETITION_PROTOCOLS,
   PlaceType,
@@ -17,14 +18,16 @@ export default function Step2Page() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const placeParam = (searchParams.get("place") as PlaceType) || "home";
-  const step1Score = searchParams.get("score") || "0";
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const animationRef = useRef<number>();
 
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isMounted, setIsMounted] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false); // 시스템 음성 재생 중
-  const [isRecording, setIsRecording] = useState(false); // 마이크 활성화 중
-  const [silenceCounter, setSilenceCounter] = useState(0); // 침묵 시간 측정
-  const [audioData, setAudioData] = useState<number>(0); // 실시간 오디오 수치 (그래프용)
+  const [isRecording, setIsRecording] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   const trainingData = useMemo(
     () =>
@@ -34,201 +37,169 @@ export default function Step2Page() {
   );
   const currentItem = trainingData[currentIndex];
 
-  // 오디오 분석을 위한 Ref
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const animationRef = useRef<number>();
+  // 폰트 사이즈 계산 로직: 글자 수가 많아질수록 작게 (최소 2rem ~ 최대 5rem)
+  const getFontSize = (text: string) => {
+    const length = text.length;
+    if (length <= 5) return "text-7xl lg:text-8xl";
+    if (length <= 10) return "text-5xl lg:text-7xl";
+    if (length <= 15) return "text-4xl lg:text-5xl";
+    return "text-3xl lg:text-4xl"; // 아주 긴 문장
+  };
 
-  useEffect(() => {
-    setIsMounted(true);
-    return () => {
-      window.speechSynthesis.cancel();
-      stopMicrophone();
-    };
+  const initMedia = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 480, height: 360 },
+        audio: true,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) videoRef.current.srcObject = stream;
+    } catch (err) {
+      console.error("Media fail:", err);
+    }
   }, []);
 
-  // 1. 시스템 사운드 재생
-  const playVoice = useCallback(() => {
-    window.speechSynthesis.cancel();
-    setIsSpeaking(true);
-    setIsRecording(false);
-
-    const msg = new SpeechSynthesisUtterance(currentItem.text);
-    msg.lang = "ko-KR";
-    msg.rate = 0.8;
-    msg.onend = () => setIsSpeaking(false); // 사운드 끝나면 상태 변경
-    window.speechSynthesis.speak(msg);
-  }, [currentItem]);
-
-  useEffect(() => {
-    if (isMounted) playVoice();
-  }, [currentIndex, isMounted, playVoice]);
-
-  // 2. 마이크 켜기 & 오디오 분석
-  const startMicrophone = async () => {
+  const startRecording = async () => {
+    if (!streamRef.current) await initMedia();
+    if (!streamRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const audioContext = new AudioContext();
-      const source = audioContext.createMediaStreamSource(stream);
+      const audioContext = new (
+        window.AudioContext || (window as any).webkitAudioContext
+      )();
+      const source = audioContext.createMediaStreamSource(streamRef.current);
       const analyser = audioContext.createAnalyser();
       analyser.fftSize = 256;
       source.connect(analyser);
-
       audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
       setIsRecording(true);
-      setSilenceCounter(0);
-
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const updateAudioData = () => {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const update = () => {
         analyser.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((a, b) => a + b) / bufferLength;
-        setAudioData(average); // 실시간 수치 데이터 저장 (0~255)
-
-        // 침묵 감지 로직 (수치가 10 미만이면 침묵으로 간주)
-        if (average < 10) {
-          setSilenceCounter((prev) => prev + 1 / 60); // 약 60fps 기준
-        } else {
-          setSilenceCounter(0);
-        }
-
-        animationRef.current = requestAnimationFrame(updateAudioData);
+        setAudioLevel(dataArray.reduce((a, b) => a + b) / dataArray.length);
+        animationRef.current = requestAnimationFrame(update);
       };
-      updateAudioData();
+      update();
     } catch (err) {
-      console.error("마이크 접근 실패:", err);
+      console.error("Recording fail:", err);
     }
   };
 
-  const stopMicrophone = () => {
+  const stopAndNext = useCallback(() => {
     setIsRecording(false);
-    setAudioData(0);
+    setAudioLevel(0);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    if (streamRef.current)
-      streamRef.current.getTracks().forEach((track) => track.stop());
     if (audioContextRef.current) audioContextRef.current.close();
-  };
-
-  // 3. 10초 침묵 시 자동 이동
-  useEffect(() => {
-    if (silenceCounter >= 10) {
-      stopMicrophone();
-      alert(
-        "아무런 말을 하지 않은 상태에서 10초 이상 지나 자동으로 다음으로 넘어갑니다.",
-      );
-      handleNext();
-    }
-  }, [silenceCounter]);
-
-  const handleNext = () => {
-    stopMicrophone();
-    if (currentIndex < trainingData.length - 1) {
+    if (currentIndex < trainingData.length - 1)
       setCurrentIndex((prev) => prev + 1);
-    } else {
-      router.push(`/step-3?place=${placeParam}&step1=${step1Score}`);
-    }
-  };
+    else router.push(`/step-3?place=${placeParam}`);
+  }, [currentIndex, trainingData.length, router, placeParam]);
+
+  useEffect(() => {
+    setIsMounted(true);
+    initMedia();
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [initMedia]);
 
   if (!isMounted || !currentItem) return null;
 
   return (
-    <div className="flex flex-col h-full w-full bg-white rounded-[40px] shadow-sm border border-gray-100 overflow-hidden text-black font-sans">
-      <header className="px-10 py-4 border-b border-gray-50 flex justify-between items-center">
-        <div className="text-left">
-          <span className="text-[#DAA520] font-black text-[10px] tracking-widest uppercase block mb-0.5">
-            Step 02
-          </span>
-          <h2 className="text-2xl font-black text-[#8B4513] tracking-tighter">
-            따라말하기
-          </h2>
-        </div>
-        <div className="bg-[#F8F9FA] px-6 py-1.5 rounded-2xl font-black text-xl text-[#DAA520]">
-          {currentIndex + 1} / 10
-        </div>
-      </header>
+    <MainLayoutShell
+      monitoring={null}
+      dashboard={null}
+      content={
+        <div className="flex flex-col lg:flex-row h-full w-full gap-6 lg:gap-10 p-4 lg:p-8 bg-white">
+          {/* [좌측 패널] 고정 */}
+          <div className="w-full lg:w-[280px] flex lg:flex-col gap-4 shrink-0 border-b lg:border-b-0 lg:border-r border-gray-100 pb-4 lg:pb-0 lg:pr-8">
+            <div className="w-1/3 lg:w-full bg-black rounded-[30px] overflow-hidden aspect-video shadow-md border-2 border-white">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                className="w-full h-full object-cover -scale-x-100"
+              />
+            </div>
+            <div className="flex-1 lg:w-full bg-[#F8F9FA] rounded-[25px] p-5 space-y-4">
+              <MetricRow label="대칭지수" value={92} color="bg-emerald-500" />
+              <MetricRow
+                label="음성 레벨"
+                value={audioLevel}
+                color="bg-blue-500"
+              />
+            </div>
+          </div>
 
-      <div className="flex-1 flex flex-col items-center justify-center p-4 space-y-6">
-        {/* 문장 표시 */}
-        <div className="text-center space-y-4">
-          <p className="text-gray-400 font-bold text-lg">
-            문장을 듣고 똑같이 말씀해 보세요
-          </p>
-          <div className="bg-amber-50 px-12 py-8 rounded-[40px] border-4 border-amber-100/50 shadow-inner">
-            <h1 className="text-5xl font-black text-[#8B4513] leading-tight break-keep">
-              {currentItem.text}
-            </h1>
+          {/* [메인 영역] */}
+          <div className="flex-1 flex flex-col min-w-0">
+            <div className="flex justify-end mb-4">
+              <div className="bg-[#F8F9FA] px-5 py-1.5 rounded-xl font-black text-amber-500 border border-amber-50">
+                {currentIndex + 1} / {trainingData.length}
+              </div>
+            </div>
+
+            <div className="flex-1 flex flex-col items-center justify-center">
+              <p className="text-gray-300 font-bold text-lg mb-8">
+                문장을 듣고 똑같이 말씀해 보세요
+              </p>
+
+              {/* 텍스트 박스 높이 고정 (h-48 ~ h-64) 및 내부 폰트 유동 조절 */}
+              <div className="w-full max-w-[900px] h-[200px] lg:h-[320px] bg-[#8B4513] px-8 py-4 rounded-[50px] lg:rounded-[60px] shadow-xl border-b-[10px] lg:border-b-[14px] border-black/20 flex items-center justify-center">
+                <h1
+                  className={`text-white font-black text-center break-keep leading-tight transition-all duration-300 ${getFontSize(currentItem.text)}`}
+                >
+                  {currentItem.text}
+                </h1>
+              </div>
+
+              <div className="mt-12 flex flex-col items-center gap-4">
+                <button
+                  onClick={isRecording ? stopAndNext : startRecording}
+                  className={`w-24 h-24 lg:w-32 lg:h-32 rounded-full shadow-xl transition-all flex items-center justify-center text-4xl lg:text-5xl ${
+                    isRecording
+                      ? "bg-red-500 animate-pulse"
+                      : "bg-amber-500 hover:scale-105"
+                  }`}
+                >
+                  {isRecording ? "⏹️" : "▶️"}
+                </button>
+                <p
+                  className={`font-black uppercase tracking-widest text-[10px] lg:text-xs ${isRecording ? "text-red-500" : "text-gray-200"}`}
+                >
+                  {isRecording ? "분석 중 - 완료 시 클릭" : "START TRAINING"}
+                </p>
+              </div>
+            </div>
           </div>
         </div>
+      }
+    />
+  );
+}
 
-        {/* 🔹 오디오 시각화 그래프 영역 */}
-        <div className="w-full max-w-xs h-24 flex items-end justify-center gap-1">
-          {isRecording ? (
-            Array.from({ length: 20 }).map((_, i) => (
-              <div
-                key={i}
-                className="w-2 bg-amber-500 rounded-full transition-all duration-75"
-                style={{
-                  height: `${Math.max(10, audioData * Math.random() + 10)}%`,
-                }}
-              />
-            ))
-          ) : (
-            <div className="text-gray-200 font-bold">대기 중...</div>
-          )}
-        </div>
-
-        {/* 컨트롤 버튼 */}
-        <div className="flex flex-col items-center space-y-6">
-          {!isRecording ? (
-            <button
-              disabled={isSpeaking}
-              onClick={startMicrophone}
-              className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-xl transition-all ${
-                isSpeaking
-                  ? "bg-gray-100 text-gray-300"
-                  : "bg-amber-500 text-white hover:scale-105 active:scale-95"
-              }`}
-            >
-              <span className="text-5xl mb-1">▶️</span>
-              <span className="text-[10px] font-black uppercase">
-                재생/시작
-              </span>
-            </button>
-          ) : (
-            <button
-              onClick={handleNext}
-              className="w-32 h-32 bg-red-500 text-white rounded-full flex flex-col items-center justify-center shadow-xl animate-pulse hover:scale-105 active:scale-95 transition-all"
-            >
-              <span className="text-5xl mb-1">⏹️</span>
-              <span className="text-[10px] font-black uppercase">
-                정지/저장
-              </span>
-            </button>
-          )}
-
-          {isRecording && (
-            <div className="text-center">
-              <p className="text-amber-600 font-black animate-pulse">
-                마이크가 켜져 있습니다. 말씀해 주세요!
-              </p>
-              <p className="text-gray-400 text-sm mt-1">
-                침묵 시 자동 종료까지:{" "}
-                {Math.max(0, 10 - Math.floor(silenceCounter))}초
-              </p>
-            </div>
-          )}
-        </div>
+function MetricRow({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number;
+  color: string;
+}) {
+  return (
+    <div className="w-full space-y-1">
+      <div className="flex justify-between text-[10px] font-black text-gray-500 uppercase">
+        <span>{label}</span>
+        <span>{value.toFixed(0)}</span>
       </div>
-
-      <footer className="py-5 px-10 bg-[#F8F9FA]/50 border-t border-gray-50 flex justify-between items-center text-[10px] font-black text-[#8B4513]/30 uppercase tracking-[0.2em]">
-        <span>Voice Data: {audioData.toFixed(2)} dB</span>
-        <span>Question {currentIndex + 1} / 10</span>
-      </footer>
+      <div className="w-full h-1.5 bg-gray-200 rounded-full overflow-hidden">
+        <div
+          className={`h-full ${color} transition-all`}
+          style={{ width: `${Math.min(value, 100)}%` }}
+        />
+      </div>
     </div>
   );
 }
