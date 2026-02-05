@@ -1,9 +1,14 @@
-// src/app/(training)/step-1/page.tsx
 "use client";
 
 export const dynamic = "force-dynamic";
 
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, {
+  useState,
+  useEffect,
+  useMemo,
+  useCallback,
+  useRef,
+} from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { REHAB_PROTOCOLS, PlaceType } from "@/constants/trainingData";
 
@@ -12,51 +17,85 @@ let GLOBAL_SPEECH_LOCK: Record<number, boolean> = {};
 export default function Step1Page() {
   const router = useRouter();
   const searchParams = useSearchParams();
-
   const placeParam = (searchParams.get("place") as PlaceType) || "home";
 
   const [isMounted, setIsMounted] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
-  const [isSpeaking, setIsSpeaking] = useState(false); // 🔹 음성 재생 중 상태 추가
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isAnswered, setIsAnswered] = useState(false); // 🔹 답변 완료 여부
+
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   useEffect(() => {
     setIsMounted(true);
     GLOBAL_SPEECH_LOCK = {};
+
     return () => {
       if (typeof window !== "undefined" && window.speechSynthesis) {
         window.speechSynthesis.cancel();
+        utteranceRef.current = null;
       }
     };
   }, []);
 
   const trainingData = useMemo(() => {
     const protocol = REHAB_PROTOCOLS[placeParam] || REHAB_PROTOCOLS.home;
-    return [...protocol.basic, ...protocol.intermediate, ...protocol.advanced];
+    const combined = [
+      ...protocol.basic,
+      ...protocol.intermediate,
+      ...protocol.advanced,
+    ];
+
+    const questions = combined.slice(0, 10);
+
+    // 🔹 Fisher-Yates 셔플
+    const shuffled = [...questions];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+
+    return shuffled;
   }, [placeParam]);
 
   const currentItem = trainingData[currentIndex];
 
-  // 🔹 수정된 playInstruction: 음성이 끝나면 타이머를 시작함
   const playInstruction = useCallback(
     (text: string) => {
       if (typeof window !== "undefined" && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-        setIsSpeaking(true); // 음성 시작 알림
-        setTimeLeft(null); // 음성 중에는 타이머 정지
+        if (utteranceRef.current) {
+          window.speechSynthesis.cancel();
+          utteranceRef.current = null;
+        }
+
+        setIsSpeaking(true);
+        setTimeLeft(null);
 
         setTimeout(() => {
           const msg = new SpeechSynthesisUtterance(text);
           msg.lang = "ko-KR";
           msg.rate = 0.85;
 
-          // ✅ 음성 재생이 끝났을 때 실행될 로직
+          const voices = window.speechSynthesis.getVoices();
+          const koVoice = voices.find((v) => v.lang.includes("ko"));
+          if (koVoice) msg.voice = koVoice;
+
           msg.onend = () => {
+            utteranceRef.current = null;
             setIsSpeaking(false);
-            setTimeLeft(currentItem.duration); // 음성이 끝나면 그때 데이터에 정의된 시간 주입
+            setTimeLeft(currentItem?.duration || 10);
           };
 
+          msg.onerror = (e) => {
+            console.error("❌ TTS 에러:", e.error);
+            utteranceRef.current = null;
+            setIsSpeaking(false);
+            setTimeLeft(currentItem?.duration || 10);
+          };
+
+          utteranceRef.current = msg;
           window.speechSynthesis.speak(msg);
         }, 300);
       }
@@ -64,9 +103,18 @@ export default function Step1Page() {
     [currentItem],
   );
 
+  // 🔹 정답 처리 (중복 클릭 방지)
   const handleAnswer = useCallback(
     (userAnswer: boolean | null) => {
-      if (window.speechSynthesis) window.speechSynthesis.cancel();
+      if (isAnswered) return; // 🔹 이미 답변했으면 무시
+
+      setIsAnswered(true); // 🔹 답변 완료 플래그
+
+      if (window.speechSynthesis && utteranceRef.current) {
+        window.speechSynthesis.cancel();
+        utteranceRef.current = null;
+      }
+
       if (!currentItem) return;
 
       const isCorrect =
@@ -76,16 +124,28 @@ export default function Step1Page() {
       if (isCorrect) setScore((prev) => prev + 1);
       setTimeLeft(null);
 
-      if (currentIndex < trainingData.length - 1) {
-        setCurrentIndex((prev) => prev + 1);
-      } else {
-        router.push(`/step-2?score=${nextScore}&place=${placeParam}`);
-      }
+      // 🔹 다음 문제로 넘어갈 때 답변 플래그 초기화
+      setTimeout(() => {
+        if (currentIndex < trainingData.length - 1) {
+          setCurrentIndex((prev) => prev + 1);
+          setIsAnswered(false); // 🔹 다음 문제에서 다시 답변 가능
+        } else {
+          router.push(`/step-2?score=${nextScore}&place=${placeParam}`);
+        }
+      }, 500);
     },
-    [currentIndex, currentItem, score, trainingData.length, router, placeParam],
+    [
+      currentIndex,
+      currentItem,
+      score,
+      trainingData.length,
+      router,
+      placeParam,
+      isAnswered,
+    ],
   );
 
-  // 🔹 페이지 진입 시 첫 음성 실행
+  // 🔹 문제 진입 시 자동 재생
   useEffect(() => {
     if (!isMounted || !currentItem) return;
     if (GLOBAL_SPEECH_LOCK[currentIndex]) return;
@@ -96,13 +156,12 @@ export default function Step1Page() {
       () => {
         playInstruction(currentItem.question);
       },
-      currentIndex === 0 ? 1500 : 800,
+      currentIndex === 0 ? 500 : 800, // 🔹 첫 문제 0.5초로 단축
     );
 
     return () => clearTimeout(timer);
   }, [currentIndex, isMounted, currentItem, playInstruction]);
 
-  // 🔹 타이머 로직: timeLeft가 있을 때만 작동
   useEffect(() => {
     if (!isMounted || timeLeft === null || isSpeaking) return;
 
@@ -121,10 +180,11 @@ export default function Step1Page() {
   if (!isMounted || !currentItem) return null;
 
   return (
-    <div className="flex flex-col h-full w-full bg-white rounded-[40px] shadow-sm border border-gray-100 overflow-hidden text-black font-sans">
-      <header className="flex justify-between items-center px-10 py-4 border-b border-gray-50">
+    <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
+      {/* HEADER */}
+      <header className="px-10 py-6 border-b border-gray-50 flex justify-between items-center bg-white shrink-0">
         <div className="text-left">
-          <span className="text-[#DAA520] font-black text-[10px] tracking-widest uppercase block mb-0.5">
+          <span className="text-[#DAA520] font-black text-[11px] tracking-[0.2em] uppercase">
             Step 01 • {placeParam.toUpperCase()}
           </span>
           <h2 className="text-2xl font-black text-[#8B4513] tracking-tighter">
@@ -132,111 +192,89 @@ export default function Step1Page() {
           </h2>
         </div>
 
-        {/* 🔹 타이머 UI: 음성 중에는 '대기' 상태 표시 가능 */}
         <div
-          className={`px-6 py-1.5 rounded-[20px] font-black text-[32px] transition-all duration-500 shadow-sm ${
+          className={`px-6 py-2 rounded-full font-black text-2xl transition-all duration-500 shadow-sm ${
             isSpeaking
-              ? "bg-gray-100 text-gray-300" // 음성 중일 때 색상
-              : timeLeft !== null && timeLeft <= 5
-                ? "bg-amber-500 text-white scale-105 shadow-amber-200"
-                : "bg-[#F8F9FA] text-[#DAA520]"
+              ? "bg-gray-50 text-gray-200"
+              : "bg-[#F8F9FA] text-[#DAA520]"
           }`}
         >
-          {isSpeaking ? "👂" : `${timeLeft ?? currentItem.duration}s`}
+          {isSpeaking ? "LISTENING" : `${timeLeft ?? currentItem.duration}s`}
         </div>
       </header>
 
-      <div className="flex-1 flex flex-col items-center justify-center p-4 space-y-6">
-        <div className="relative mb-2">
-          <div
-            className={`
-              inline-block px-10 py-5 rounded-[35px] shadow-xl transition-all duration-500 text-center
-              ${
+      {/* MAIN */}
+      <main className="flex-1 flex flex-col items-center justify-center p-6 overflow-hidden relative">
+        <div className="w-full max-w-4xl flex flex-col items-center gap-10">
+          {/* 가이드 메시지 */}
+          <div className="h-32 flex items-center justify-center">
+            <div
+              className={`px-10 py-6 rounded-[40px] shadow-xl transition-all duration-500 border-4 ${
                 !isSpeaking && timeLeft !== null && timeLeft <= 5
-                  ? "bg-amber-500 border-transparent scale-105"
-                  : "bg-white border-4 border-[#DAA520]/15"
-              }
-            `}
-          >
-            <p
-              className={`text-3xl font-black tracking-tight leading-tight ${
-                !isSpeaking && timeLeft !== null && timeLeft <= 5
-                  ? "text-white"
-                  : "text-[#8B4513]"
+                  ? "bg-amber-500 border-transparent scale-105 text-white"
+                  : "bg-white border-[#DAA520]/15 text-[#8B4513]"
               }`}
             >
-              {isSpeaking
-                ? "문제를 잘 들어보세요"
-                : timeLeft !== null && timeLeft <= 5
-                  ? "천천히 생각해보시고 눌러주세요"
-                  : "정답을 골라주세요"}
-            </p>
-            <div
-              className={`absolute -bottom-2.5 left-1/2 -translate-x-1/2 w-6 h-6 rotate-45 ${
-                !isSpeaking && timeLeft !== null && timeLeft <= 5
-                  ? "bg-amber-500"
-                  : "bg-white border-r-4 border-b-4 border-[#DAA520]/10"
+              <p className="text-3xl font-black tracking-tight leading-tight">
+                {isSpeaking ? "문제를 잘 들어보세요" : "정답을 골라주세요"}
+              </p>
+            </div>
+          </div>
+
+          {/* 🔹 다시 듣기 버튼 (재생 중이거나 답변 완료 시 비활성) */}
+          <div className="h-44 flex flex-col items-center justify-center gap-3">
+            <button
+              onClick={() => playInstruction(currentItem.question)}
+              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-2xl transition-all active:scale-95 border-4 ${
+                isSpeaking || isAnswered
+                  ? "bg-gray-50 border-gray-200 pointer-events-none opacity-30"
+                  : "bg-white border-[#DAA520]/10 hover:border-[#DAA520]"
               }`}
-            />
+            >
+              <span className={`text-5xl ${isSpeaking ? "animate-pulse" : ""}`}>
+                🔊
+              </span>
+            </button>
+            <span className="text-[10px] font-black text-[#DAA520] tracking-widest uppercase">
+              {isSpeaking ? "재생 중" : "다시 듣기"}
+            </span>
+          </div>
+
+          {/* 🔹 O/X 선택지 (재생 중이거나 답변 완료 시 비활성) */}
+          <div className="flex gap-10">
+            <button
+              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              onClick={() => handleAnswer(true)}
+              className="w-52 h-52 bg-white rounded-[60px] text-[120px] shadow-2xl border-2 border-gray-50 flex items-center justify-center transition-all hover:border-blue-200 active:scale-90 disabled:opacity-20 disabled:cursor-not-allowed"
+            >
+              ⭕
+            </button>
+            <button
+              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              onClick={() => handleAnswer(false)}
+              className="w-52 h-52 bg-white rounded-[60px] text-[120px] shadow-2xl border-2 border-gray-50 flex items-center justify-center transition-all hover:border-red-200 active:scale-90 disabled:opacity-20 disabled:cursor-not-allowed"
+            >
+              ❌
+            </button>
           </div>
         </div>
+      </main>
 
-        <button
-          onClick={() => playInstruction(currentItem.question)}
-          className={`group w-36 h-36 rounded-full flex flex-col items-center justify-center shadow-md border-2 transition-all active:scale-95 ${
-            isSpeaking
-              ? "bg-amber-50 border-amber-300 pointer-events-none"
-              : "bg-[#F8F9FA] border-[#DAA520]/10 hover:border-[#DAA520]"
-          }`}
-        >
-          <span
-            className={`text-6xl mb-1 ${isSpeaking ? "animate-pulse" : "group-hover:scale-110 transition-transform"}`}
-          >
-            {isSpeaking ? "🔊" : "🔊"}
-          </span>
-          <span className="text-[10px] font-black text-[#DAA520] tracking-widest uppercase">
-            {isSpeaking ? "말하는 중..." : "다시 듣기"}
-          </span>
-        </button>
-
-        <div className="flex gap-8">
-          <button
-            disabled={isSpeaking}
-            onClick={() => handleAnswer(true)}
-            className={`w-48 h-48 bg-white rounded-[50px] text-[110px] shadow-[0_15px_40px_-10px_rgba(0,0,0,0.08)] border-2 flex items-center justify-center transition-all duration-300 ${
-              isSpeaking
-                ? "opacity-50 cursor-not-allowed"
-                : "active:scale-90 hover:border-blue-200"
-            }`}
-          >
-            ⭕
-          </button>
-          <button
-            disabled={isSpeaking}
-            onClick={() => handleAnswer(false)}
-            className={`w-48 h-48 bg-white rounded-[50px] text-[110px] shadow-[0_15px_40px_-10px_rgba(0,0,0,0.08)] border-2 flex items-center justify-center transition-all duration-300 ${
-              isSpeaking
-                ? "opacity-50 cursor-not-allowed"
-                : "active:scale-90 hover:border-red-200"
-            }`}
-          >
-            ❌
-          </button>
-        </div>
-      </div>
-
-      <footer className="py-5 px-10 bg-[#F8F9FA]/50 border-t border-gray-50">
-        <div className="max-w-xl mx-auto text-center">
-          <div className="w-full bg-gray-200 h-3 rounded-full overflow-hidden mb-2 shadow-inner">
+      {/* FOOTER */}
+      <footer className="px-10 py-6 border-t border-gray-50 bg-white shrink-0">
+        <div className="max-w-xl mx-auto flex items-center gap-5">
+          <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden shadow-inner">
             <div
-              className="h-full bg-[#DAA520] transition-all duration-500 ease-out"
+              className="h-full bg-[#DAA520] transition-all duration-1000 ease-out"
               style={{
                 width: `${((currentIndex + 1) / trainingData.length) * 100}%`,
               }}
             />
           </div>
-          <span className="font-black text-[#8B4513]/40 text-[10px] tracking-[0.2em] uppercase">
-            QUESTION {currentIndex + 1} / {trainingData.length}
+          <span className="shrink-0 font-black text-[#8B4513]/30 text-xs tracking-widest">
+            {Math.min(currentIndex + 1, trainingData.length)} /{" "}
+            {trainingData.length}
           </span>
         </div>
       </footer>

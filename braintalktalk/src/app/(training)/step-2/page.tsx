@@ -1,14 +1,9 @@
 "use client";
 
-import React, {
-  useState,
-  useEffect,
-  useCallback,
-  useMemo,
-  useRef,
-} from "react";
-import { useSearchParams, useRouter } from "next/navigation";
-import MainLayoutShell from "@/components/layout/MainLayoutShell";
+import React, { useState, useRef, useMemo } from "react"; // 🔹 useMemo 추가
+import { useRouter } from "next/navigation";
+import FaceTracker from "@/components/diagnosis/FaceTracker";
+import { MetricEngine } from "@/lib/training/MetricEngine";
 import {
   SPEECH_REPETITION_PROTOCOLS,
   PlaceType,
@@ -16,187 +11,180 @@ import {
 
 export default function Step2Page() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-  const placeParam = (searchParams.get("place") as PlaceType) || "home";
-
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const animationRef = useRef<number>();
-
+  const [currentPlace] = useState<PlaceType>("cafe");
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [isMounted, setIsMounted] = useState(false);
-  const [isRecording, setIsRecording] = useState(false);
+  const [metrics, setMetrics] = useState({ symmetryScore: 0, openingRatio: 0 });
   const [audioLevel, setAudioLevel] = useState(0);
+  const [isRecording, setIsRecording] = useState(false);
+  const [resultScore, setResultScore] = useState<number | null>(null);
 
-  const trainingData = useMemo(
-    () =>
-      SPEECH_REPETITION_PROTOCOLS[placeParam] ||
-      SPEECH_REPETITION_PROTOCOLS.home,
-    [placeParam],
-  );
-  const currentItem = trainingData[currentIndex];
+  const audioEngineRef = useRef<MetricEngine | null>(null);
 
-  // 폰트 사이즈 계산 로직: 글자 수가 많아질수록 작게 (최소 2rem ~ 최대 5rem)
-  const getFontSize = (text: string) => {
-    const length = text.length;
-    if (length <= 5) return "text-7xl lg:text-8xl";
-    if (length <= 10) return "text-5xl lg:text-7xl";
-    if (length <= 15) return "text-4xl lg:text-5xl";
-    return "text-3xl lg:text-4xl"; // 아주 긴 문장
-  };
+  // 🔹 랜덤 섞기
+  const protocol = useMemo(() => {
+    const questions = SPEECH_REPETITION_PROTOCOLS[currentPlace];
 
-  const initMedia = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 480, height: 360 },
-        audio: true,
-      });
-      streamRef.current = stream;
-      if (videoRef.current) videoRef.current.srcObject = stream;
-    } catch (err) {
-      console.error("Media fail:", err);
+    // Fisher-Yates 셔플
+    const shuffled = [...questions];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
-  }, []);
 
-  const startRecording = async () => {
-    if (!streamRef.current) await initMedia();
-    if (!streamRef.current) return;
-    try {
-      const audioContext = new (
-        window.AudioContext || (window as any).webkitAudioContext
-      )();
-      const source = audioContext.createMediaStreamSource(streamRef.current);
-      const analyser = audioContext.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      audioContextRef.current = audioContext;
-      setIsRecording(true);
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      const update = () => {
-        analyser.getByteFrequencyData(dataArray);
-        setAudioLevel(dataArray.reduce((a, b) => a + b) / dataArray.length);
-        animationRef.current = requestAnimationFrame(update);
-      };
-      update();
-    } catch (err) {
-      console.error("Recording fail:", err);
+    return shuffled;
+  }, [currentPlace]);
+
+  const currentItem = protocol[currentIndex];
+
+  const handleToggleRecording = async () => {
+    if (!isRecording) {
+      setResultScore(null);
+      try {
+        if (!audioEngineRef.current)
+          audioEngineRef.current = new MetricEngine();
+        await audioEngineRef.current.startAudioAnalysis((level) =>
+          setAudioLevel(level),
+        );
+        setIsRecording(true);
+      } catch (err) {
+        console.error(err);
+      }
+    } else {
+      audioEngineRef.current?.stop();
+      setIsRecording(false);
+      setResultScore(
+        Math.min(
+          100,
+          Math.floor(
+            metrics.symmetryScore * 0.8 + (metrics.openingRatio > 15 ? 20 : 10),
+          ),
+        ),
+      );
+      setTimeout(() => {
+        if (currentIndex < protocol.length - 1) {
+          setCurrentIndex((prev) => prev + 1);
+          setResultScore(null);
+        } else {
+          router.push("/step-3");
+        }
+      }, 1200);
     }
   };
-
-  const stopAndNext = useCallback(() => {
-    setIsRecording(false);
-    setAudioLevel(0);
-    if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    if (audioContextRef.current) audioContextRef.current.close();
-    if (currentIndex < trainingData.length - 1)
-      setCurrentIndex((prev) => prev + 1);
-    else router.push(`/step-3?place=${placeParam}`);
-  }, [currentIndex, trainingData.length, router, placeParam]);
-
-  useEffect(() => {
-    setIsMounted(true);
-    initMedia();
-    return () => {
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-    };
-  }, [initMedia]);
-
-  if (!isMounted || !currentItem) return null;
 
   return (
-    <MainLayoutShell
-      monitoring={null}
-      dashboard={null}
-      content={
-        <div className="flex flex-col lg:flex-row h-full w-full gap-6 lg:gap-10 p-4 lg:p-8 bg-white">
-          {/* [좌측 패널] 고정 */}
-          <div className="w-full lg:w-[280px] flex lg:flex-col gap-4 shrink-0 border-b lg:border-b-0 lg:border-r border-gray-100 pb-4 lg:pb-0 lg:pr-8">
-            <div className="w-1/3 lg:w-full bg-black rounded-[30px] overflow-hidden aspect-video shadow-md border-2 border-white">
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="w-full h-full object-cover -scale-x-100"
+    <>
+      <header className="px-10 py-6 border-b border-gray-50 flex justify-between items-center bg-white shrink-0">
+        <div className="text-left">
+          <span className="text-[#DAA520] font-black text-[11px] tracking-[0.2em] uppercase">
+            Step 02 • {currentPlace.toUpperCase()}
+          </span>
+          <h2 className="text-2xl font-black text-[#8B4513] tracking-tighter">
+            문장 복창 훈련
+          </h2>
+        </div>
+        <div className="bg-gray-50 px-5 py-2 rounded-full font-black text-sm text-gray-400">
+          <span className="text-orange-500">{currentIndex + 1}</span> /{" "}
+          {protocol.length}
+        </div>
+      </header>
+
+      <div className="flex flex-1 overflow-hidden">
+        <aside className="w-[380px] border-r border-gray-50 bg-[#FCFCFC] p-8 shrink-0">
+          <div className="space-y-4">
+            <FaceTracker
+              onMetricsUpdate={(m) =>
+                setMetrics({
+                  symmetryScore: m.symmetryScore,
+                  openingRatio: m.openingRatio * 100,
+                })
+              }
+            />
+            <div className="bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm space-y-4">
+              <MetricBar
+                label="안면 대칭"
+                value={metrics.symmetryScore}
+                unit="%"
+                color="bg-emerald-500"
               />
-            </div>
-            <div className="flex-1 lg:w-full bg-[#F8F9FA] rounded-[25px] p-5 space-y-4">
-              <MetricRow label="대칭지수" value={92} color="bg-emerald-500" />
-              <MetricRow
+              <MetricBar
+                label="입 벌림"
+                value={metrics.openingRatio}
+                unit=""
+                color="bg-amber-400"
+              />
+              <MetricBar
                 label="음성 레벨"
                 value={audioLevel}
+                unit="dB"
                 color="bg-blue-500"
               />
             </div>
-          </div>
-
-          {/* [메인 영역] */}
-          <div className="flex-1 flex flex-col min-w-0">
-            <div className="flex justify-end mb-4">
-              <div className="bg-[#F8F9FA] px-5 py-1.5 rounded-xl font-black text-amber-500 border border-amber-50">
-                {currentIndex + 1} / {trainingData.length}
-              </div>
-            </div>
-
-            <div className="flex-1 flex flex-col items-center justify-center">
-              <p className="text-gray-300 font-bold text-lg mb-8">
-                문장을 듣고 똑같이 말씀해 보세요
-              </p>
-
-              {/* 텍스트 박스 높이 고정 (h-48 ~ h-64) 및 내부 폰트 유동 조절 */}
-              <div className="w-full max-w-[900px] h-[200px] lg:h-[320px] bg-[#8B4513] px-8 py-4 rounded-[50px] lg:rounded-[60px] shadow-xl border-b-[10px] lg:border-b-[14px] border-black/20 flex items-center justify-center">
-                <h1
-                  className={`text-white font-black text-center break-keep leading-tight transition-all duration-300 ${getFontSize(currentItem.text)}`}
-                >
-                  {currentItem.text}
-                </h1>
-              </div>
-
-              <div className="mt-12 flex flex-col items-center gap-4">
-                <button
-                  onClick={isRecording ? stopAndNext : startRecording}
-                  className={`w-24 h-24 lg:w-32 lg:h-32 rounded-full shadow-xl transition-all flex items-center justify-center text-4xl lg:text-5xl ${
-                    isRecording
-                      ? "bg-red-500 animate-pulse"
-                      : "bg-amber-500 hover:scale-105"
-                  }`}
-                >
-                  {isRecording ? "⏹️" : "▶️"}
-                </button>
-                <p
-                  className={`font-black uppercase tracking-widest text-[10px] lg:text-xs ${isRecording ? "text-red-500" : "text-gray-200"}`}
-                >
-                  {isRecording ? "분석 중 - 완료 시 클릭" : "START TRAINING"}
+            {resultScore !== null && (
+              <div className="bg-orange-50 rounded-[32px] p-6 text-center border border-orange-100 animate-in fade-in zoom-in duration-300">
+                <p className="text-4xl font-black text-orange-700">
+                  {resultScore}%
                 </p>
               </div>
+            )}
+          </div>
+        </aside>
+
+        <main className="flex-1 flex flex-col items-center justify-center bg-white px-20">
+          <div className="w-full max-w-3xl flex flex-col items-center gap-12">
+            <p className="text-gray-400 font-bold text-sm uppercase tracking-[0.3em]">
+              정확하게 따라 읽어보세요
+            </p>
+
+            <div className="bg-[#8B4513] w-full py-20 px-12 rounded-[70px] shadow-2xl text-center relative overflow-hidden min-h-[280px] flex items-center justify-center">
+              <h1 className="text-5xl font-black text-white leading-tight break-keep z-10">
+                {currentItem?.text}
+              </h1>
+              <div className="absolute top-[-20px] right-[-10px] text-white/5 text-[180px] font-black italic select-none">
+                {currentIndex + 1}
+              </div>
+            </div>
+
+            <div className="h-48 flex flex-col items-center justify-center gap-6">
+              <button
+                onClick={handleToggleRecording}
+                className={`relative w-32 h-32 rounded-full shadow-2xl flex items-center justify-center transition-all duration-300 active:scale-95 ${
+                  isRecording
+                    ? "bg-red-500 ring-[12px] ring-red-50"
+                    : "bg-orange-500 hover:scale-105"
+                }`}
+              >
+                {isRecording ? (
+                  <div className="w-10 h-10 bg-white rounded-md animate-pulse" />
+                ) : (
+                  <div className="w-0 h-0 border-t-[22px] border-t-transparent border-l-[36px] border-l-white border-b-[22px] border-b-transparent ml-3" />
+                )}
+              </button>
+              <p
+                className={`font-black text-xs tracking-widest uppercase transition-colors ${isRecording ? "text-red-500" : "text-gray-300"}`}
+              >
+                {isRecording ? "분석 중입니다..." : "버튼을 눌러 훈련 시작"}
+              </p>
             </div>
           </div>
-        </div>
-      }
-    />
+        </main>
+      </div>
+    </>
   );
 }
 
-function MetricRow({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: number;
-  color: string;
-}) {
+function MetricBar({ label, value, unit, color }: any) {
   return (
-    <div className="w-full space-y-1">
-      <div className="flex justify-between text-[10px] font-black text-gray-500 uppercase">
+    <div className="space-y-1.5 font-black">
+      <div className="flex justify-between text-[10px] text-gray-400 uppercase tracking-tighter">
         <span>{label}</span>
-        <span>{value.toFixed(0)}</span>
+        <span>
+          {value.toFixed(1)}
+          {unit}
+        </span>
       </div>
-      <div className="w-full h-1.5 bg-gray-200 rounded-full overflow-hidden">
+      <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
         <div
-          className={`h-full ${color} transition-all`}
+          className={`h-full ${color} transition-all duration-300`}
           style={{ width: `${Math.min(value, 100)}%` }}
         />
       </div>
