@@ -11,6 +11,7 @@ export interface SpeechAnalysisResult {
   pronunciationScore: number; // 0-100 발음 점수
   duration: number; // ms
   audioLevel: number; // dB
+  audioBlob?: Blob;
 }
 
 export interface PronunciationMetrics {
@@ -92,6 +93,20 @@ export class AudioRecorder {
       };
       this.mediaRecorder.stop();
     });
+  }
+
+  // ✅ 추가: 녹음된 Blob 반환 (stopRecording 전용)
+  getLastAudioBlob(): Blob | null {
+    console.log("🎙️ [DEBUG] audioChunks.length:", this.audioChunks.length);
+
+    if (this.audioChunks.length === 0) {
+      console.error("❌ audioChunks가 비어있습니다!");
+      return null;
+    }
+
+    const blob = new Blob(this.audioChunks, { type: "audio/webm" });
+    console.log("✅ Blob 생성 완료. size:", blob.size);
+    return blob;
   }
 
   private cleanup() {
@@ -313,31 +328,38 @@ export class SpeechAnalyzer {
     this.startTime = Date.now();
     await this.recorder.startRecording(onAudioLevel);
   }
-
+  async getRecordedAudio(): Promise<Blob> {
+    const blob = this.recorder.getLastAudioBlob();
+    if (!blob) {
+      throw new Error("녹음된 오디오가 없습니다.");
+    }
+    return blob;
+  }
   async stopAnalysis(expectedText: string): Promise<SpeechAnalysisResult> {
+    console.log("🎙️ [DEBUG] stopAnalysis 시작");
+
+    // ✅ stopRecording이 Blob을 반환하니까 그걸 바로 사용
     const audioBlob = await this.recorder.stopRecording();
+    console.log("✅ stopRecording 완료. Blob size:", audioBlob.size);
+
     const duration = Date.now() - this.startTime;
 
-    // 🔹 환경변수에 따른 모드 스위칭
     const isDevMode = process.env.NEXT_PUBLIC_DEV_MODE === "true";
 
     if (isDevMode) {
-      console.log(
-        "🛠️ [TEST MODE] OpenAI를 호출하지 않고 가짜 데이터를 반환합니다.",
-      );
-      // 분석 중인 느낌을 주기 위한 지연 시간
+      console.log("🛠️ [TEST MODE] 가짜 데이터 반환");
       await new Promise((resolve) => setTimeout(resolve, 1200));
 
       return {
-        transcript: expectedText, // 사용자가 완벽하게 발음한 것으로 가정
+        transcript: expectedText,
         confidence: 0.99,
         pronunciationScore: 100,
         duration,
         audioLevel: 45,
+        audioBlob, // ✅ 확실하게 존재
       };
     }
 
-    // 🔹 실제 모드: OpenAI Whisper API 호출 (유료)
     const { text, confidence } = await this.transcriber.transcribe(audioBlob);
     const metrics = this.pronunciationAnalyzer.analyzePronunciation(
       expectedText,
@@ -350,6 +372,7 @@ export class SpeechAnalyzer {
       pronunciationScore: Math.round(metrics.clarityScore),
       duration,
       audioLevel: 0,
+      audioBlob, // ✅ 확실하게 존재
     };
   }
 }

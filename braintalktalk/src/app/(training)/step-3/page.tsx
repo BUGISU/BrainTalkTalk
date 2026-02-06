@@ -26,6 +26,7 @@ export default function Step3Page() {
   const [playCount, setPlayCount] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isAnswered, setIsAnswered] = useState(false);
+  const [canAnswer, setCanAnswer] = useState(false); // ✅ 선택 가능 여부 상태 추가
 
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
@@ -41,13 +42,11 @@ export default function Step3Page() {
     };
   }, []);
 
-  // 🔹 10문제 랜덤 섞기
   const protocol = useMemo(() => {
     const allQuestions = (
       VISUAL_MATCHING_PROTOCOLS[place] || VISUAL_MATCHING_PROTOCOLS.home
     ).slice(0, 10);
 
-    // Fisher-Yates 셔플
     const shuffled = [...allQuestions];
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -61,12 +60,14 @@ export default function Step3Page() {
 
   const speakWord = useCallback((text: string) => {
     if (typeof window !== "undefined" && window.speechSynthesis) {
+      // ✅ 재생 시작 즉시 선택 불가 상태로 변경
+      setIsSpeaking(true);
+      setCanAnswer(false);
+
       if (utteranceRef.current) {
         window.speechSynthesis.cancel();
         utteranceRef.current = null;
       }
-
-      setIsSpeaking(true);
 
       setTimeout(() => {
         const utterance = new SpeechSynthesisUtterance(text);
@@ -80,12 +81,14 @@ export default function Step3Page() {
         utterance.onend = () => {
           utteranceRef.current = null;
           setIsSpeaking(false);
+          setCanAnswer(true); // ✅ 음성이 끝나야 선택 가능
         };
 
         utterance.onerror = (e) => {
           console.error("❌ TTS 에러:", e);
           utteranceRef.current = null;
           setIsSpeaking(false);
+          setCanAnswer(true);
         };
 
         utteranceRef.current = utterance;
@@ -100,6 +103,7 @@ export default function Step3Page() {
 
     GLOBAL_SPEECH_LOCK[currentIndex] = true;
     setPlayCount(0);
+    setCanAnswer(false); // ✅ 진입 시 잠금
 
     const timer = setTimeout(
       () => {
@@ -112,6 +116,7 @@ export default function Step3Page() {
   }, [currentIndex, isMounted, currentItem, speakWord]);
 
   const handleReplay = () => {
+    // 이미 선택했거나 재생 중이면 무시
     if (playCount < 1 && !selectedId && !isSpeaking && !isAnswered) {
       speakWord(currentItem.targetWord);
       setPlayCount((prev) => prev + 1);
@@ -119,7 +124,8 @@ export default function Step3Page() {
   };
 
   const handleOptionClick = (id: string) => {
-    if (selectedId || isAnswered) return;
+    // ✅ 음성 재생 중이거나 이미 답변했으면 클릭 방지
+    if (!canAnswer || selectedId || isAnswered) return;
 
     if (window.speechSynthesis && utteranceRef.current) {
       window.speechSynthesis.cancel();
@@ -131,6 +137,7 @@ export default function Step3Page() {
     setSelectedId(id);
     setShowResult(isCorrect);
     setIsAnswered(true);
+    setCanAnswer(false); // ✅ 답변 완료 후 추가 클릭 방지
 
     setTimeout(() => {
       if (currentIndex < protocol.length - 1) {
@@ -138,6 +145,7 @@ export default function Step3Page() {
         setSelectedId(null);
         setShowResult(null);
         setIsAnswered(false);
+        // 다음 문제는 useEffect의 GLOBAL_SPEECH_LOCK에서 speakWord 호출하며 setCanAnswer 제어
       } else {
         router.push(`/step-4?place=${place}`);
       }
@@ -145,6 +153,10 @@ export default function Step3Page() {
   };
 
   if (!isMounted || !currentItem) return null;
+
+  // ✅ 버튼/선택지 공통 비활성화 조건
+  const isInteractionDisabled =
+    !isMounted || isSpeaking || isAnswered || !canAnswer;
 
   return (
     <div className="flex flex-col h-screen bg-white overflow-hidden">
@@ -194,7 +206,6 @@ export default function Step3Page() {
         <main className="flex-1 flex flex-col items-center justify-center bg-white px-12 overflow-y-auto">
           <section className="w-full max-w-2xl flex flex-col items-center gap-8 py-4">
             <div className="w-full flex flex-col items-center gap-6">
-              {/* 🔹 제목 고정 */}
               <div className="h-20 flex items-center justify-center">
                 <p className="text-3xl font-black text-[#8B4513]/40 uppercase tracking-[0.3em] text-center">
                   {isSpeaking
@@ -203,17 +214,13 @@ export default function Step3Page() {
                 </p>
               </div>
 
+              {/* 🔹 다시 듣기 버튼 */}
               <button
                 onClick={handleReplay}
-                disabled={
-                  playCount >= 1 ||
-                  selectedId !== null ||
-                  isSpeaking ||
-                  isAnswered
-                }
+                disabled={playCount >= 1 || isInteractionDisabled}
                 className={`w-20 h-20 rounded-full flex items-center justify-center transition-all shadow-xl border-b-4
                   ${
-                    playCount < 1 && !selectedId && !isSpeaking && !isAnswered
+                    playCount < 1 && !isInteractionDisabled
                       ? "bg-white text-[#DAA520] border-gray-100 hover:scale-105 active:scale-95 active:border-b-0 active:translate-y-1"
                       : "bg-gray-50 text-gray-300 border-transparent cursor-not-allowed scale-90"
                   }`}
@@ -242,12 +249,14 @@ export default function Step3Page() {
               </span>
             </div>
 
+            {/* 🔹 그림 선택지 영역 */}
             <div className="grid grid-cols-3 gap-4 w-full max-w-lg shrink-0 pb-8">
               {currentItem.options.map((option) => (
                 <button
                   key={option.id}
                   onClick={() => handleOptionClick(option.id)}
-                  disabled={selectedId !== null || isSpeaking || isAnswered}
+                  // ✅ 음성 재생 중이거나 이미 답변한 경우 비활성화
+                  disabled={isInteractionDisabled}
                   className={`
                     relative aspect-square rounded-[24px] flex items-center justify-center
                     transition-all duration-300 border-2 shadow-sm overflow-hidden
@@ -256,7 +265,7 @@ export default function Step3Page() {
                         ? showResult
                           ? "bg-emerald-50 border-emerald-500 scale-105 z-10 shadow-md"
                           : "bg-red-50 border-red-500 scale-95 opacity-50"
-                        : isSpeaking || isAnswered
+                        : isInteractionDisabled
                           ? "bg-[#FBFBFC] border-gray-100 opacity-50 cursor-not-allowed"
                           : "bg-[#FBFBFC] border-gray-100 hover:border-[#DAA520]/40 hover:bg-white active:scale-95 shadow-sm"
                     }

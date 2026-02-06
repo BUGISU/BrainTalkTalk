@@ -1,10 +1,10 @@
 "use client";
 
-import React, { useState, useRef, useMemo, useEffect } from "react";
+import React, { useState, useRef, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import FaceTracker from "@/components/diagnosis/FaceTracker";
 import { SpeechAnalyzer } from "@/lib/speech/SpeechAnalyzer";
-import { SessionManager, Step2Result } from "@/lib/kwab/SessionManager";
+import { SessionManager } from "@/lib/kwab/SessionManager";
 import { loadPatientProfile } from "@/lib/patientStorage";
 import {
   SPEECH_REPETITION_PROTOCOLS,
@@ -20,46 +20,74 @@ export default function Step2Page() {
   const [metrics, setMetrics] = useState({ symmetryScore: 0, openingRatio: 0 });
   const [audioLevel, setAudioLevel] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false); // 🔹 분석 중 상태 추가
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [resultScore, setResultScore] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<string>("");
-  const [analysisResults, setAnalysisResults] = useState<
-    Array<{
-      text: string;
-      symmetryScore: number;
-      pronunciationScore: number;
-      audioLevel: number;
-    }>
-  >([]);
+  const [analysisResults, setAnalysisResults] = useState<any[]>([]);
+  const [recordedAudios, setRecordedAudios] = useState<any[]>([]);
+  const [currentAudioUrl, setCurrentAudioUrl] = useState<string>("");
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
 
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const analyzerRef = useRef<SpeechAnalyzer | null>(null);
 
-  // 1. 프로토콜 랜덤 섞기
   const protocol = useMemo(() => {
     const questions =
       SPEECH_REPETITION_PROTOCOLS[place] || SPEECH_REPETITION_PROTOCOLS.cafe;
-    const shuffled = [...questions];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    return shuffled;
+    return [...questions].sort(() => Math.random() - 0.5);
   }, [place]);
 
   const currentItem = protocol[currentIndex];
 
-  // 2. 녹음 및 분석 제어 (이동 로직 보정)
+  // ✅ 결과 저장 함수 추가
+  const saveStep2Results = (results: any[], audios: any[]) => {
+    const patient = loadPatientProfile();
+    if (!patient) return;
+    const sessionManager = new SessionManager(
+      { age: patient.age, educationYears: patient.educationYears || 0 },
+      place,
+    );
+    sessionManager.saveStep2Result({
+      items: results,
+      averageSymmetry:
+        results.reduce((a, b) => a + b.symmetryScore, 0) / results.length,
+      averagePronunciation:
+        results.reduce((a, b) => a + b.pronunciationScore, 0) / results.length,
+      timestamp: Date.now(),
+    });
+  };
+
+  // ✅ 오디오 정지 함수 (분리됨)
+  const stopAudio = () => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current = null;
+    }
+    setIsPlayingAudio(false);
+    handleNextTransition();
+  };
+
+  // ✅ 다음 단계 이동 공통 로직
+  const handleNextTransition = () => {
+    setResultScore(null);
+    setTranscript("");
+    setCurrentAudioUrl("");
+    if (currentIndex < protocol.length - 1) {
+      setCurrentIndex((prev) => prev + 1);
+      setAudioLevel(0);
+    } else {
+      saveStep2Results(analysisResults, recordedAudios);
+      router.push(`/step-3?place=${place}`);
+    }
+  };
+
   const handleToggleRecording = async () => {
     if (!isRecording) {
-      // --- 녹음 시작 ---
       setResultScore(null);
       setTranscript("");
       try {
         const apiKey = process.env.NEXT_PUBLIC_OPENAI_API_KEY;
-        if (!apiKey) {
-          alert("OpenAI API 키를 확인해주세요.");
-          return;
-        }
+        if (!apiKey) return alert("API 키를 확인해주세요.");
         if (!analyzerRef.current)
           analyzerRef.current = new SpeechAnalyzer(apiKey);
         await analyzerRef.current.startAnalysis((level) =>
@@ -67,75 +95,54 @@ export default function Step2Page() {
         );
         setIsRecording(true);
       } catch (err) {
-        console.error("Recording Start Error:", err);
+        console.error(err);
       }
     } else {
-      // --- 녹음 중지 및 분석 ---
       try {
         setIsRecording(false);
-        setIsAnalyzing(true); // 🔹 분석 중 레이블 표시
-
+        setIsAnalyzing(true);
         if (!analyzerRef.current) return;
-        const result = await analyzerRef.current.stopAnalysis(currentItem.text);
 
+        const result = await analyzerRef.current.stopAnalysis(currentItem.text);
+        if (!result.audioBlob) return setIsAnalyzing(false);
+
+        const audioUrl = URL.createObjectURL(result.audioBlob);
         setTranscript(result.transcript);
         setResultScore(result.pronunciationScore);
-
-        const newResult = {
-          text: currentItem.text,
-          symmetryScore: metrics.symmetryScore,
-          pronunciationScore: result.pronunciationScore,
-          audioLevel: result.audioLevel,
-        };
-
-        // 🔹 state 업데이트와 별개로 최신 배열 생성하여 이동 로직에 사용
-        const updatedResults = [...analysisResults, newResult];
-        setAnalysisResults(updatedResults);
-
-        // 🔹 2.5초 대기 후 다음 단계로 자동 이동
-        setTimeout(() => {
-          setIsAnalyzing(false);
-
-          if (currentIndex < protocol.length - 1) {
-            // 다음 문제로
-            setCurrentIndex((prev) => prev + 1);
-            setResultScore(null);
-            setTranscript("");
-            setAudioLevel(0);
-          } else {
-            // Step 2 완료 후 Step 3 이동
-            saveStep2Results(updatedResults);
-            router.push(`/step-3?place=${place}`);
-          }
-        }, 2500);
-      } catch (err) {
-        console.error("Analysis Error:", err);
-        alert("음성 분석 중 오류가 발생했습니다.");
-        setIsRecording(false);
+        setCurrentAudioUrl(audioUrl);
         setIsAnalyzing(false);
+
+        const updatedResults = [
+          ...analysisResults,
+          {
+            text: currentItem.text,
+            symmetryScore: metrics.symmetryScore,
+            pronunciationScore: result.pronunciationScore,
+            audioLevel: result.audioLevel,
+          },
+        ];
+        setAnalysisResults(updatedResults);
+        setRecordedAudios([
+          ...recordedAudios,
+          { text: currentItem.text, audioUrl },
+        ]);
+
+        // ✅ 자동 재생 로직
+        setTimeout(() => {
+          const audio = new Audio(audioUrl);
+          audioPlayerRef.current = audio;
+          setIsPlayingAudio(true);
+          audio.onended = () => {
+            setIsPlayingAudio(false);
+            handleNextTransition();
+          };
+          audio.play().catch(() => setIsPlayingAudio(false));
+        }, 500);
+      } catch (err) {
+        setIsAnalyzing(false);
+        console.error(err);
       }
     }
-  };
-
-  const saveStep2Results = (results: typeof analysisResults) => {
-    const patient = loadPatientProfile();
-    if (!patient) return;
-    const sessionManager = new SessionManager(
-      { age: patient.age, educationYears: patient.educationYears || 0 },
-      place,
-    );
-    const avgSymmetry =
-      results.reduce((sum, r) => sum + r.symmetryScore, 0) / results.length;
-    const avgPronunciation =
-      results.reduce((sum, r) => sum + r.pronunciationScore, 0) /
-      results.length;
-
-    sessionManager.saveStep2Result({
-      items: results,
-      averageSymmetry: avgSymmetry,
-      averagePronunciation: avgPronunciation,
-      timestamp: Date.now(),
-    });
   };
 
   return (
@@ -166,7 +173,6 @@ export default function Step2Page() {
                 })
               }
             />
-
             <div className="bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm space-y-4">
               <MetricBar
                 label="안면 대칭"
@@ -180,7 +186,6 @@ export default function Step2Page() {
                 unit=""
                 color="bg-amber-400"
               />
-
               <div className="space-y-2 pt-2 border-t border-gray-50">
                 <MetricBar
                   label="음성 레벨"
@@ -188,43 +193,45 @@ export default function Step2Page() {
                   unit="dB"
                   color={isRecording ? "bg-red-500" : "bg-blue-400"}
                 />
-                {isRecording && (
-                  <div className="flex gap-1 h-6 items-end justify-center bg-gray-50 rounded-lg overflow-hidden">
-                    {[...Array(15)].map((_, i) => (
-                      <div
-                        key={i}
-                        className="w-1 bg-red-400 rounded-full transition-all duration-75"
-                        style={{
-                          height: `${Math.random() * audioLevel + 10}%`,
-                        }}
-                      />
-                    ))}
-                  </div>
-                )}
               </div>
             </div>
 
-            {/* 결과 패널 */}
-            {(resultScore !== null || transcript) && (
-              <div className="bg-orange-50 rounded-[32px] p-6 border border-orange-100 space-y-4 animate-in fade-in slide-in-from-bottom-4">
-                <div className="text-center">
-                  <p className="text-5xl font-black text-orange-700">
-                    {resultScore}%
-                  </p>
-                  <p className="text-[10px] font-black text-orange-400 uppercase tracking-widest mt-1">
-                    발음 정확도
-                  </p>
+            <div
+              className={`bg-orange-50 rounded-[32px] p-6 border-2 transition-all duration-500 ${isPlayingAudio ? "border-blue-400 shadow-lg" : "border-orange-100"}`}
+            >
+              {resultScore !== null && transcript ? (
+                <>
+                  <div className="text-center">
+                    <p className="text-5xl font-black text-orange-700">
+                      {resultScore}%
+                    </p>
+                    <p className="text-[10px] font-black text-orange-400 uppercase tracking-widest mt-1">
+                      발음 정확도
+                    </p>
+                  </div>
+                  <div className="bg-white/80 p-4 rounded-2xl border border-orange-100/50 mt-4">
+                    <p className="text-[10px] font-black text-gray-400 uppercase mb-2">
+                      인식된 텍스트
+                    </p>
+                    <p className="text-base font-bold text-gray-800 leading-snug">
+                      "{transcript}"
+                    </p>
+                  </div>
+                  {isPlayingAudio && (
+                    <button
+                      onClick={stopAudio}
+                      className="w-full mt-4 py-3 bg-red-500 text-white rounded-2xl font-bold text-sm hover:bg-red-600 animate-pulse"
+                    >
+                      ⏹️ 정지 후 다음으로
+                    </button>
+                  )}
+                </>
+              ) : (
+                <div className="text-center py-12 text-gray-300 text-sm font-bold">
+                  녹음 후 결과가 표시됩니다
                 </div>
-                <div className="bg-white/80 p-4 rounded-2xl border border-orange-100/50">
-                  <p className="text-[10px] font-black text-gray-400 uppercase mb-2">
-                    인식된 텍스트
-                  </p>
-                  <p className="text-base font-bold text-gray-800 leading-snug break-keep">
-                    "{transcript}"
-                  </p>
-                </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </aside>
 
@@ -233,32 +240,21 @@ export default function Step2Page() {
             <p className="text-gray-400 font-bold text-sm uppercase tracking-[0.3em]">
               정확하게 따라 읽어보세요
             </p>
-
             <div
               className={`w-full py-20 px-12 rounded-[70px] shadow-2xl text-center relative overflow-hidden min-h-[280px] flex items-center justify-center transition-all duration-500 ${isRecording ? "bg-red-600 scale-[1.02]" : "bg-[#8B4513]"}`}
             >
-              <h1 className="text-5xl font-black text-white leading-tight break-keep z-10 relative">
+              <h1 className="text-5xl font-black text-white leading-tight break-keep z-10">
                 {currentItem?.text}
               </h1>
               {isRecording && (
                 <div className="absolute inset-0 opacity-20 bg-white animate-pulse" />
               )}
-              <div className="absolute top-[-20px] right-[-10px] text-white/5 text-[180px] font-black italic select-none">
-                {currentIndex + 1}
-              </div>
             </div>
-
-            <div className="h-48 flex flex-col items-center justify-center gap-6 text-center">
+            <div className="h-48 flex flex-col items-center justify-center gap-6">
               <button
                 onClick={handleToggleRecording}
-                disabled={isAnalyzing}
-                className={`relative w-32 h-32 rounded-full shadow-2xl flex items-center justify-center transition-all duration-300 active:scale-95 ${
-                  isRecording
-                    ? "bg-white ring-[12px] ring-red-500/20"
-                    : isAnalyzing
-                      ? "bg-gray-100 cursor-wait"
-                      : "bg-orange-500 hover:scale-105"
-                }`}
+                disabled={isAnalyzing || isPlayingAudio}
+                className={`relative w-32 h-32 rounded-full shadow-2xl flex items-center justify-center transition-all duration-300 ${isRecording ? "bg-white ring-[12px] ring-red-500/20" : isAnalyzing || isPlayingAudio ? "bg-gray-100" : "bg-orange-500"}`}
               >
                 {isRecording ? (
                   <div className="w-10 h-10 bg-red-500 rounded-lg animate-pulse" />
@@ -267,25 +263,17 @@ export default function Step2Page() {
                 ) : (
                   <div className="w-0 h-0 border-t-[22px] border-t-transparent border-l-[36px] border-l-white border-b-[22px] border-b-transparent ml-3" />
                 )}
-                {isRecording && (
-                  <div className="absolute inset-0 rounded-full border-4 border-red-400 opacity-50 animate-ping" />
-                )}
               </button>
-
               <p
-                className={`font-black text-sm tracking-widest uppercase transition-colors ${
-                  isRecording
-                    ? "text-red-500"
-                    : isAnalyzing
-                      ? "text-orange-500"
-                      : "text-gray-300"
-                }`}
+                className={`font-black text-sm tracking-widest uppercase ${isRecording ? "text-red-500" : isAnalyzing ? "text-orange-500" : isPlayingAudio ? "text-blue-500" : "text-gray-300"}`}
               >
                 {isRecording
-                  ? "목소리를 인식하고 있습니다..."
+                  ? "인식 중..."
                   : isAnalyzing
-                    ? "정확도를 분석하고 있습니다..."
-                    : "버튼을 눌러 훈련 시작"}
+                    ? "분석 중..."
+                    : isPlayingAudio
+                      ? "내 목소리 듣는 중..."
+                      : "버튼을 눌러 시작"}
               </p>
             </div>
           </div>

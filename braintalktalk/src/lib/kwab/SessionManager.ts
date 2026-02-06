@@ -28,6 +28,13 @@ export interface Step1Result {
   totalQuestions: number;
   averageResponseTime: number; // ms
   timestamp: number;
+  items: Array<{
+    question: string;
+    userAnswer: boolean | null;
+    correctAnswer: boolean;
+    isCorrect: boolean;
+    responseTime: number;
+  }>;
 }
 
 export interface Step2Result {
@@ -263,7 +270,7 @@ export class SessionManager {
     }
 
     const totalScore = Math.round(
-      (step5.correctAnswers / step5.totalQuestions) * 100
+      (step5.correctAnswers / step5.totalQuestions) * 100,
     );
     return { totalScore: Math.min(totalScore, 100) };
   }
@@ -351,7 +358,7 @@ export class SessionManager {
 
 export function useSessionManager(patient: PatientProfile, place: string) {
   const manager = new SessionManager(patient, place);
-  
+
   return {
     session: manager.getSession(),
     kwabScores: manager.getKWABScores(),

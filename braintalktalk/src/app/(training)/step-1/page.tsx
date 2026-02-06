@@ -27,8 +27,17 @@ export default function Step1Page() {
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isAnswered, setIsAnswered] = useState(false);
-  const [responseTimes, setResponseTimes] = useState<number[]>([]); // 반응 시간 기록
-  const [questionStartTime, setQuestionStartTime] = useState<number>(0); // 문제 시작 시간
+  const [canAnswer, setCanAnswer] = useState(false);
+  const [questionStartTime, setQuestionStartTime] = useState<number>(0);
+  const [questionResults, setQuestionResults] = useState<
+    Array<{
+      question: string;
+      userAnswer: boolean | null;
+      correctAnswer: boolean;
+      isCorrect: boolean;
+      responseTime: number;
+    }>
+  >([]);
 
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
@@ -53,14 +62,11 @@ export default function Step1Page() {
     ];
 
     const questions = combined.slice(0, 10);
-
-    // 🔹 Fisher-Yates 셔플
     const shuffled = [...questions];
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
-
     return shuffled;
   }, [placeParam]);
 
@@ -69,13 +75,14 @@ export default function Step1Page() {
   const playInstruction = useCallback(
     (text: string) => {
       if (typeof window !== "undefined" && window.speechSynthesis) {
+        setIsSpeaking(true);
+        setCanAnswer(false);
+        setTimeLeft(null);
+
         if (utteranceRef.current) {
           window.speechSynthesis.cancel();
           utteranceRef.current = null;
         }
-
-        setIsSpeaking(true);
-        setTimeLeft(null);
 
         setTimeout(() => {
           const msg = new SpeechSynthesisUtterance(text);
@@ -89,14 +96,14 @@ export default function Step1Page() {
           msg.onend = () => {
             utteranceRef.current = null;
             setIsSpeaking(false);
+            setCanAnswer(true);
             setTimeLeft(currentItem?.duration || 10);
-            setQuestionStartTime(Date.now()); // 문제 시작 시간 기록
+            setQuestionStartTime(Date.now());
           };
 
-          msg.onerror = (e) => {
-            console.error("❌ TTS 에러:", e.error);
-            utteranceRef.current = null;
+          msg.onerror = () => {
             setIsSpeaking(false);
+            setCanAnswer(true);
             setTimeLeft(currentItem?.duration || 10);
           };
 
@@ -108,65 +115,69 @@ export default function Step1Page() {
     [currentItem],
   );
 
-  // 정답 처리 (중복 클릭 방지)
   const handleAnswer = useCallback(
     (userAnswer: boolean | null) => {
-      if (isAnswered) return;
+      // ✅ 중복 답변 방지 및 현재 문항 존재 확인
+      if (isAnswered || !currentItem) return;
 
       setIsAnswered(true);
+      setCanAnswer(false);
 
-      // 반응 시간 기록
-      if (questionStartTime > 0) {
-        const responseTime = Date.now() - questionStartTime;
-        setResponseTimes((prev) => [...prev, responseTime]);
-      }
-
-      if (window.speechSynthesis && utteranceRef.current) {
-        window.speechSynthesis.cancel();
-        utteranceRef.current = null;
-      }
-
-      if (!currentItem) return;
-
+      // ✅ [중요] 사용자가 아무것도 안 눌렀거나(null), 정답과 다르면 false(0점) 처리
       const isCorrect =
         userAnswer === null ? false : currentItem.answer === userAnswer;
+
+      // ✅ 정답일 때만 점수 1점 추가, 아니면 기존 점수 유지 (0점 처리)
       const nextScore = isCorrect ? score + 1 : score;
 
+      // 반응 시간 계산 (시간 초과 시에는 해당 문항의 전체 제한 시간 기록)
+      const responseTime =
+        userAnswer === null
+          ? (currentItem.duration || 10) * 1000
+          : questionStartTime > 0
+            ? Date.now() - questionStartTime
+            : 0;
+
+      const questionResult = {
+        question: currentItem.question,
+        userAnswer: userAnswer,
+        correctAnswer: currentItem.answer,
+        isCorrect: isCorrect,
+        responseTime: responseTime,
+      };
+
+      const updatedResults = [...questionResults, questionResult];
+      setQuestionResults(updatedResults);
+
       if (isCorrect) setScore((prev) => prev + 1);
+
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
       setTimeLeft(null);
 
-      // 마지막 문제 완료 시 K-WAB 저장
       setTimeout(() => {
         if (currentIndex < trainingData.length - 1) {
           setCurrentIndex((prev) => prev + 1);
           setIsAnswered(false);
         } else {
-          // Step1 완료 - K-WAB 세션에 저장
+          // 마지막 문제 완료 후 최종 저장
           const patient = loadPatientProfile();
           if (patient) {
             const sessionManager = new SessionManager(
-              {
-                age: patient.age,
-                educationYears: patient.educationYears || 0,
-              },
-              placeParam
+              { age: patient.age, educationYears: patient.educationYears || 0 },
+              placeParam,
             );
 
-            const avgResponseTime =
-              responseTimes.length > 0
-                ? responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length
-                : 0;
-
             const step1Result: Step1Result = {
-              correctAnswers: nextScore,
+              correctAnswers: nextScore, // ✅ 여기서 계산된 최종 점수가 저장됨
               totalQuestions: trainingData.length,
-              averageResponseTime: avgResponseTime,
+              averageResponseTime:
+                updatedResults.reduce((acc, cur) => acc + cur.responseTime, 0) /
+                updatedResults.length,
               timestamp: Date.now(),
+              items: updatedResults,
             };
-
             sessionManager.saveStep1Result(step1Result);
           }
-
           router.push(`/step-2?score=${nextScore}&place=${placeParam}`);
         }
       }, 500);
@@ -180,31 +191,35 @@ export default function Step1Page() {
       placeParam,
       isAnswered,
       questionStartTime,
-      responseTimes,
+      questionResults,
     ],
   );
 
-  // 🔹 문제 진입 시 자동 재생
+  // 🔹 자동 재생 useEffect
   useEffect(() => {
     if (!isMounted || !currentItem) return;
     if (GLOBAL_SPEECH_LOCK[currentIndex]) return;
 
     GLOBAL_SPEECH_LOCK[currentIndex] = true;
+    setCanAnswer(false);
+    setIsSpeaking(true);
 
     const timer = setTimeout(
       () => {
         playInstruction(currentItem.question);
       },
-      currentIndex === 0 ? 500 : 800, // 🔹 첫 문제 0.5초로 단축
+      currentIndex === 0 ? 500 : 800,
     );
 
     return () => clearTimeout(timer);
   }, [currentIndex, isMounted, currentItem, playInstruction]);
 
+  // 🔹 타이머 관리 useEffect
   useEffect(() => {
     if (!isMounted || timeLeft === null || isSpeaking) return;
 
     if (timeLeft <= 0) {
+      // ✅ 0초 도달 시 무응답(null) 처리 -> 0점 처리됨
       handleAnswer(null);
       return;
     }
@@ -218,9 +233,11 @@ export default function Step1Page() {
 
   if (!isMounted || !currentItem) return null;
 
+  const isInteractionDisabled =
+    !isMounted || isSpeaking || isAnswered || !canAnswer;
+
   return (
     <div className="flex-1 flex flex-col h-full bg-white overflow-hidden">
-      {/* HEADER */}
       <header className="px-10 py-6 border-b border-gray-50 flex justify-between items-center bg-white shrink-0">
         <div className="text-left">
           <span className="text-[#DAA520] font-black text-[11px] tracking-[0.2em] uppercase">
@@ -230,7 +247,6 @@ export default function Step1Page() {
             청각 이해 사실 판단
           </h2>
         </div>
-
         <div
           className={`px-6 py-2 rounded-full font-black text-2xl transition-all duration-500 shadow-sm ${
             isSpeaking
@@ -242,10 +258,8 @@ export default function Step1Page() {
         </div>
       </header>
 
-      {/* MAIN */}
       <main className="flex-1 flex flex-col items-center justify-center p-6 overflow-hidden relative">
         <div className="w-full max-w-4xl flex flex-col items-center gap-10">
-          {/* 가이드 메시지 */}
           <div className="h-32 flex items-center justify-center">
             <div
               className={`px-10 py-6 rounded-[40px] shadow-xl transition-all duration-500 border-4 ${
@@ -260,13 +274,12 @@ export default function Step1Page() {
             </div>
           </div>
 
-          {/* 🔹 다시 듣기 버튼 (재생 중이거나 답변 완료 시 비활성) */}
           <div className="h-44 flex flex-col items-center justify-center gap-3">
             <button
               onClick={() => playInstruction(currentItem.question)}
-              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              disabled={isInteractionDisabled}
               className={`w-32 h-32 rounded-full flex flex-col items-center justify-center shadow-2xl transition-all active:scale-95 border-4 ${
-                isSpeaking || isAnswered
+                isInteractionDisabled
                   ? "bg-gray-50 border-gray-200 pointer-events-none opacity-30"
                   : "bg-white border-[#DAA520]/10 hover:border-[#DAA520]"
               }`}
@@ -280,17 +293,16 @@ export default function Step1Page() {
             </span>
           </div>
 
-          {/* 🔹 O/X 선택지 (재생 중이거나 답변 완료 시 비활성) */}
           <div className="flex gap-10">
             <button
-              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              disabled={isInteractionDisabled}
               onClick={() => handleAnswer(true)}
               className="w-52 h-52 bg-white rounded-[60px] text-[120px] shadow-2xl border-2 border-gray-50 flex items-center justify-center transition-all hover:border-blue-200 active:scale-90 disabled:opacity-20 disabled:cursor-not-allowed"
             >
               ⭕
             </button>
             <button
-              disabled={isSpeaking || isAnswered} // 🔹 답변 완료 시 비활성
+              disabled={isInteractionDisabled}
               onClick={() => handleAnswer(false)}
               className="w-52 h-52 bg-white rounded-[60px] text-[120px] shadow-2xl border-2 border-gray-50 flex items-center justify-center transition-all hover:border-red-200 active:scale-90 disabled:opacity-20 disabled:cursor-not-allowed"
             >
@@ -300,7 +312,6 @@ export default function Step1Page() {
         </div>
       </main>
 
-      {/* FOOTER */}
       <footer className="px-10 py-6 border-t border-gray-50 bg-white shrink-0">
         <div className="max-w-xl mx-auto flex items-center gap-5">
           <div className="flex-1 h-3 bg-gray-100 rounded-full overflow-hidden shadow-inner">
